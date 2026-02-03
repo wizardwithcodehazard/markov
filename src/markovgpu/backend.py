@@ -97,7 +97,6 @@ class MarkovEngine:
 
         # CPU Path
         if not self.use_gpu or N < GPU_THRESHOLD:
-            # print(f"🔄 Converging on CPU (N={N})...")
             current_v = start_v.copy()
             for i in range(max_steps):
                 new_v = current_v.dot(P)
@@ -107,7 +106,6 @@ class MarkovEngine:
             return current_v
 
         # GPU Path
-        # print(f"🔄 Converging on GPU (N={N})...")
         mf = cl.mem_flags
         P = np.ascontiguousarray(P, dtype=np.float32)
         start_v = np.ascontiguousarray(start_v, dtype=np.float32)
@@ -136,13 +134,6 @@ class MarkovEngine:
         return current_v
 
     # --- 2. Inference & Viterbi ---
-    def hmm_filter(self, transition_matrix, observation_probs):
-        """Standard HMM Filter (Returns Probabilities)"""
-        # Simplification: Running basic HMM forward pass
-        # For production use, usually prefer Log-Space to avoid underflow.
-        # This wrapper can be upgraded to use k_hmm_log if needed.
-        pass
-
     def decode_regime(self, transition_matrix, observation_probs):
         """Viterbi Algorithm (Finds Most Likely Path)"""
         T, N = observation_probs.shape
@@ -231,96 +222,124 @@ class MarkovEngine:
         """Baum-Welch Expectation Maximization (Training)"""
         T = observations.shape[0]
         N = n_states
+        mf = cl.mem_flags
 
-        # Random Init
+        # 1. Initialize Params (Log Space)
         log_trans = np.log(
             np.full((N, N), 1.0 / N) + np.random.rand(N, N) * 0.01
         ).astype(np.float32)
         log_emis = np.log(observations + 1e-20).astype(np.float32)
 
-        mf = cl.mem_flags
-        d_trans = cl.Buffer(
-            self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=log_trans
-        )
-        d_alpha = cl.Buffer(self.ctx, mf.READ_WRITE, size=T * N * 4)  # Full history
-        d_beta = cl.Buffer(self.ctx, mf.READ_WRITE, size=T * N * 4)  # Full history
+        # 2. Allocate GPU Memory (VRAM)
+        # We allocate FULL history on GPU to avoid copying back and forth
+        d_trans = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=log_trans)
         d_emis = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=log_emis)
-
+        
+        d_alpha = cl.Buffer(self.ctx, mf.READ_WRITE, size=T * N * 4) # float32 = 4 bytes
+        d_beta = cl.Buffer(self.ctx, mf.READ_WRITE, size=T * N * 4)
+        
         d_new_trans = cl.Buffer(self.ctx, mf.READ_WRITE, size=log_trans.nbytes)
         d_gamma_sums = cl.Buffer(self.ctx, mf.READ_WRITE, size=N * 4)
 
         prev_score = -np.inf
 
-        print(f"🧠 Training HMM ({N} States, {T} Steps)...")
+        print(f"🧠 Training HMM ({N} States, {T} Steps) on GPU...")
+
+        # Host buffers for initial checks and final readback
+        init_alpha = np.zeros(N, dtype=np.float32)
+        final_alpha_T = np.zeros(N, dtype=np.float32)
 
         for i in range(n_iters):
-            # 1. CPU Forward/Backward (Latency Optimized)
-            alpha_full, log_likelihood = self._cpu_forward(log_trans, log_emis)
-            beta_full = self._cpu_backward(log_trans, log_emis)
+            
+            # --- A. Forward Pass (GPU Loop) ---
+            # Init Alpha[0] on CPU then send (fast enough for 1 step)
+            init_alpha[:] = -np.log(N) + log_emis[0]
+            cl.enqueue_copy(self.queue, d_alpha, init_alpha, is_blocking=False) # Write to offset 0
 
-            # 2. GPU Accumulation (Throughput Optimized)
-            cl.enqueue_copy(self.queue, d_alpha, alpha_full)
-            cl.enqueue_copy(self.queue, d_beta, beta_full)
-            cl.enqueue_copy(self.queue, d_trans, log_trans)
+            # Loop t=1 to T
+            for t in range(1, T):
+                prev_offset = (t - 1) * N
+                curr_offset = t * N
+                emis_offset = t * N
+                
+                self.k_hmm_log(
+                    self.queue, (N,), None,
+                    np.int32(N),
+                    d_alpha,            # Full Buffer
+                    np.int32(prev_offset), 
+                    np.int32(curr_offset),
+                    d_trans,
+                    d_emis,             # Full Buffer
+                    np.int32(emis_offset)
+                )
 
+            # --- B. Backward Pass (GPU Loop) ---
+            # Init Beta[T-1] to 0.0 (log(1))
+            # We can use clEnqueueFillBuffer, but pyopencl 2022+ is cleaner with copy
+            init_beta_end = np.zeros(N, dtype=np.float32) # log(1) = 0
+            beta_end_offset = (T - 1) * N * 4 # Bytes offset
+            cl.enqueue_copy(self.queue, d_beta, init_beta_end, dst_offset=beta_end_offset, is_blocking=False)
+
+            # Loop t = T-2 down to 0
+            for t in range(T - 2, -1, -1):
+                curr_offset = t * N
+                future_offset = (t + 1) * N
+                future_emis_offset = (t + 1) * N
+
+                self.k_hmm_back(
+                    self.queue, (N,), None,
+                    np.int32(N),
+                    d_beta,            # Full Buffer
+                    np.int32(future_offset),
+                    np.int32(curr_offset),
+                    d_trans,
+                    d_emis,
+                    np.int32(future_emis_offset)
+                )
+
+            # --- C. Accumulation (GPU) ---
+            # Wait for loops to finish
+            self.queue.finish()
+
+            # Condense Alpha/Beta/Emis into new Transition Matrix
             self.k_acc_trans(
-                self.queue,
-                (N, N),
-                None,
-                np.int32(T),
-                np.int32(N),
-                d_alpha,
-                d_beta,
-                d_emis,
-                d_trans,
-                d_new_trans,
+                self.queue, (N, N), None,
+                np.int32(T), np.int32(N),
+                d_alpha, d_beta, d_emis, d_trans, d_new_trans
             )
 
+            # Condense into Gamma Sums
             self.k_acc_gamma(
-                self.queue,
-                (N,),
-                None,
-                np.int32(T),
-                np.int32(N),
-                d_alpha,
-                d_beta,
-                d_gamma_sums,
+                self.queue, (N,), None,
+                np.int32(T), np.int32(N),
+                d_alpha, d_beta, d_gamma_sums
             )
 
-            # 3. Update
+            # --- D. Update & Check Convergence (CPU) ---
+            # We only read back the "Summary Statistics", not the T*N buffers
             new_log_trans_counts = np.empty_like(log_trans)
             log_gamma_sums = np.empty(N, dtype=np.float32)
 
             cl.enqueue_copy(self.queue, new_log_trans_counts, d_new_trans)
             cl.enqueue_copy(self.queue, log_gamma_sums, d_gamma_sums)
+            
+            # Calc Likelihood from Alpha[T-1] for convergence check
+            # Read just the last N floats
+            alpha_T_offset = (T - 1) * N * 4
+            cl.enqueue_copy(self.queue, final_alpha_T, d_alpha, src_offset=alpha_T_offset)
+            log_likelihood = np.logaddexp.reduce(final_alpha_T)
 
+            # M-Step: Normalize
             log_trans = new_log_trans_counts - log_gamma_sums[:, None]
+            
+            # Update GPU Trans Matrix for next iteration
+            cl.enqueue_copy(self.queue, d_trans, log_trans)
 
             change = log_likelihood - prev_score
-            print(
-                f"   Iter {i + 1}: Likelihood {log_likelihood:.2f} (Delta: {change:.4f})"
-            )
+            print(f"   Iter {i + 1}: Likelihood {log_likelihood:.2f} (Delta: {change:.4f})")
+            
             if abs(change) < tolerance:
                 break
             prev_score = log_likelihood
 
         return np.exp(log_trans)
-
-    def _cpu_forward(self, log_trans, log_emis):
-        T, N = log_emis.shape
-        alpha = np.zeros((T, N), dtype=np.float32)
-        alpha[0] = -np.log(N) + log_emis[0]
-        for t in range(1, T):
-            for j in range(N):
-                prev = alpha[t - 1] + log_trans[:, j]
-                alpha[t, j] = np.logaddexp.reduce(prev) + log_emis[t, j]
-        return alpha, np.logaddexp.reduce(alpha[-1])
-
-    def _cpu_backward(self, log_trans, log_emis):
-        T, N = log_emis.shape
-        beta = np.zeros((T, N), dtype=np.float32)
-        for t in range(T - 2, -1, -1):
-            for i in range(N):
-                terms = log_trans[i, :] + log_emis[t + 1] + beta[t + 1]
-                beta[t, i] = np.logaddexp.reduce(terms)
-        return beta

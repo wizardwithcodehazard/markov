@@ -1,16 +1,14 @@
-// kernels.cl - The Complete Suite
+// kernels.cl - Fixed Write Permissions
 
 // --- HELPER: Log-Sum-Exp Trick ---
-// Prevents overflow when adding log-probabilities
 float log_add(float log_a, float log_b) {
     float max_val = max(log_a, log_b);
     float min_val = min(log_a, log_b);
     return max_val + log1p(exp(min_val - max_val));
 }
 
-// --- SECTION 1: Basic Markov Operations ---
+// --- SECTION 1: Basic Operations ---
 
-// 1. Standard Markov Step: Next = Current * Matrix
 __kernel void markov_step(
     const int N,
     __global const float *current_state,
@@ -27,8 +25,6 @@ __kernel void markov_step(
     }
 }
 
-// 2. Standard HMM Filter (Probability Space)
-// Used for simple "What state am I in?" queries without log-space
 __kernel void hmm_forward_step(
     const int N,
     __global const float *alpha_prev,
@@ -46,63 +42,72 @@ __kernel void hmm_forward_step(
     }
 }
 
-// --- SECTION 2: Advanced Log-Space Operations (Stable) ---
+// --- SECTION 2: Advanced Log-Space Operations ---
 
-// 3. Log-Space Forward (For Viterbi & Training)
+// 3. Log-Space Forward (FIXED: Removed 'const' from log_alpha_full)
 __kernel void hmm_forward_log(
     const int N,
-    __global const float *log_alpha_prev, 
-    __global const float *log_trans_mat,  
-    __global const float *log_emissions,  
-    __global float *log_alpha_new)        
+    __global float *log_alpha_full,        // <--- FIX: Removed 'const' here
+    const int prev_offset,
+    const int curr_offset,
+    __global const float *log_trans_mat,
+    __global const float *log_emissions,
+    const int emis_offset)
 {
     int id = get_global_id(0);
     if (id < N) {
         float log_sum = -INFINITY;
+        // Read from 'prev_offset' in the giant buffer
         for (int k = 0; k < N; k++) {
-            float val = log_alpha_prev[k] + log_trans_mat[k * N + id];
+            float val = log_alpha_full[prev_offset + k] + log_trans_mat[k * N + id];
             if (k == 0) log_sum = val;
             else log_sum = log_add(log_sum, val);
         }
-        log_alpha_new[id] = log_sum + log_emissions[id];
+        // Write to 'curr_offset'
+        // Read emission from 'emis_offset'
+        log_alpha_full[curr_offset + id] = log_sum + log_emissions[emis_offset + id];
     }
 }
 
-// 4. Log-Space Backward (For Training)
+// 4. Log-Space Backward
 __kernel void hmm_backward_log(
-    const int N, 
-    __global const float *beta_future, 
-    __global const float *trans, 
-    __global const float *emis_future, 
-    __global float *beta_curr) 
+    const int N,
+    __global float *beta_full,            
+    const int future_offset,              
+    const int curr_offset,                
+    __global const float *trans,
+    __global const float *emis_full,      
+    const int future_emis_offset)         
 {
     int id = get_global_id(0); // State 'i'
     if (id < N) {
         float log_sum = -INFINITY;
         for (int j=0; j<N; j++) {
-            // transition i->j + emission(t+1) + beta(t+1)
-            float val = trans[id*N + j] + emis_future[j] + beta_future[j];
+            // trans(i->j) + emis(t+1, j) + beta(t+1, j)
+            float val = trans[id*N + j] + 
+                        emis_full[future_emis_offset + j] + 
+                        beta_full[future_offset + j];
+            
             if (j==0) log_sum = val;
             else log_sum = log_add(log_sum, val);
         }
-        beta_curr[id] = log_sum;
+        beta_full[curr_offset + id] = log_sum;
     }
 }
 
-// 5. Viterbi Algorithm (Finds best path)
+// 5. Viterbi Algorithm
 __kernel void viterbi_step(
     const int N,
     __global const float *log_delta_prev,
     __global const float *log_trans_mat,
     __global const float *log_emissions,
-    __global float *log_delta_new,       
-    __global int *backpointers)          
+    __global float *log_delta_new,
+    __global int *backpointers)
 {
     int id = get_global_id(0);
     if (id < N) {
         float max_prob = -INFINITY;
         int best_prev_state = 0;
-
         for (int k = 0; k < N; k++) {
             float prob = log_delta_prev[k] + log_trans_mat[k * N + id];
             if (prob > max_prob) {
@@ -111,14 +116,13 @@ __kernel void viterbi_step(
             }
         }
         log_delta_new[id] = max_prob + log_emissions[id];
-        backpointers[id] = best_prev_state; 
+        backpointers[id] = best_prev_state;
     }
 }
 
-// --- SECTION 3: Learning Accumulators (Baum-Welch) ---
+// --- SECTION 3: Learning Accumulators ---
 
 // 6. Accumulate Transitions (E-Step)
-// Condenses time T into N*N summary matrix
 __kernel void accumulate_transitions(
     const int T, const int N,
     __global const float *alpha_full, 
@@ -134,13 +138,11 @@ __kernel void accumulate_transitions(
         float log_sum_xi = -INFINITY;
         float log_trans_val = trans_mat[row * N + col];
 
-        // Loop over time 0 to T-2
         for (int t = 0; t < T - 1; t++) {
             float log_xi = alpha_full[t*N + row] + 
                            log_trans_val + 
                            emis_full[(t+1)*N + col] + 
                            beta_full[(t+1)*N + col];
-            
             if (t == 0) log_sum_xi = log_xi;
             else log_sum_xi = log_add(log_sum_xi, log_xi);
         }
@@ -149,7 +151,6 @@ __kernel void accumulate_transitions(
 }
 
 // 7. Accumulate Gammas (E-Step)
-// Condenses time T into N summary counts
 __kernel void accumulate_gammas(
     const int T, const int N,
     __global const float *alpha_full,
