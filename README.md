@@ -3,7 +3,7 @@
 # ⚡ **MarkovGPU**
 
 ### *Massive Scale Markov Models on Consumer Hardware*
-<img width="100%" alt="MarkovGPU Hero" src="https://i.imgur.com/gK9J6hD.p" /
+<img width="1024" height="338" alt="image" src="https://github.com/user-attachments/assets/b57dab80-ba03-4d1d-bb4d-6390e3f63f52" />
 
 > **Run million-state HMMs on your laptop GPU.**  
 > **No CUDA required • Hybrid CPU/GPU Backend • Production Ready**
