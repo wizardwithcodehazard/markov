@@ -1,0 +1,52 @@
+[project]
+name = "markovgpu-rane" 
+version = "0.1.0"
+description = "High-performance Markov Chains & HMMs using OpenCL"
+readme = "README.md"
+authors = [
+    { name = "Sahil Rane", email = "sahilrane249@gmail.com" }
+]
+requires-python = ">=3.12"
+
+# Your core libraries + visualization/stats tools you used in the demos
+dependencies = [
+    "numpy>=1.26.0",       # Relaxed version constraint slightly for better compatibility
+    "pyopencl>=2024.1",
+    "matplotlib>=3.8.0",
+    "scipy>=1.11.0",
+]
+
+# Metadata tags to help people find your library on PyPI
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+# (Optional) Add your GitHub URL if you have pushed the code
+# [project.urls]
+# Repository = "https://github.com/yourusername/markovgpu"
+# Issues = "https://github.com/yourusername/markovgpu/issues"
+
+# ---------------------------------------------------------
+# BUILD SYSTEM: Hatchling (Standard for uv)
+# ---------------------------------------------------------
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# ---------------------------------------------------------
+# PACKAGING: Include the .cl Kernel file
+# ---------------------------------------------------------
+[tool.hatch.build.targets.wheel]
+packages = ["src/markovgpu"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# Map source path (left) to package destination (right)
+"src/markovgpu/kernels.cl" = "markovgpu/kernels.cl"
