@@ -1,7 +1,6 @@
 import pyopencl as cl
 import numpy as np
 import os
-import warnings
 
 # Locate the kernel file
 MODULE_PATH = os.path.dirname(os.path.abspath(__file__))
