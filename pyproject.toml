@@ -50,3 +50,9 @@ packages = ["src/markovgpu"]
 [tool.hatch.build.targets.wheel.force-include]
 # Map source path (left) to package destination (right)
 "src/markovgpu/kernels.cl" = "markovgpu/kernels.cl"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.15.0",
+]
