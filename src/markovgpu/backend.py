@@ -43,8 +43,11 @@ class MarkovEngine:
             if not os.path.exists(KERNEL_PATH):
                 raise FileNotFoundError(f"Kernel file missing at: {KERNEL_PATH}")
 
+            # OPTIMIZATION: Fast Math Build Options
+            build_options = "-cl-mad-enable -cl-fast-relaxed-math"
+
             with open(KERNEL_PATH, "r") as f:
-                self.prg = cl.Program(self.ctx, f.read()).build()
+                self.prg = cl.Program(self.ctx, f.read()).build(options=build_options)
 
             # 3. Cache Kernels (Robust Retrieval)
             self.use_gpu = True
@@ -80,19 +83,25 @@ class MarkovEngine:
             return v.dot(P)
 
         mf = cl.mem_flags
-        P = np.ascontiguousarray(P, dtype=np.float32)
+        # OPTIMIZATION: Transpose P for coalesced access
+        # The kernel expects P_T[id][k] which maps to P[k][id]
+        P_T = np.ascontiguousarray(P.T, dtype=np.float32)
         v = np.ascontiguousarray(v, dtype=np.float32)
         result = np.empty_like(v)
 
-        d_P = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=P)
+        d_P_T = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=P_T)
         d_v = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=v)
         d_res = cl.Buffer(self.ctx, mf.WRITE_ONLY, size=result.nbytes)
 
-        self.k_markov(self.queue, (N,), None, np.int32(N), d_v, d_P, d_res)
+        self.k_markov(self.queue, (N,), None, np.int32(N), d_v, d_P_T, d_res)
         cl.enqueue_copy(self.queue, result, d_res)
         return result
 
     def converge(self, P, start_v, tolerance=1e-5, max_steps=1000):
+        # Note: 'converge' currently uses the iterative step approach.
+        # For maximum optimization, this loop should ideally be moved to a kernel,
+        # but for now, we rely on the optimized 'step' logic implicitly or CPU fallback.
+        # Below is the robust hybrid implementation.
         N = len(start_v)
 
         # CPU Path
@@ -106,20 +115,20 @@ class MarkovEngine:
             return current_v
 
         # GPU Path
+        # We reuse the specific buffers to avoid reallocation overhead in loop
         mf = cl.mem_flags
-        P = np.ascontiguousarray(P, dtype=np.float32)
+        P_T = np.ascontiguousarray(P.T, dtype=np.float32)
         start_v = np.ascontiguousarray(start_v, dtype=np.float32)
 
-        d_P = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=P)
-        d_v_read = cl.Buffer(
-            self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=start_v
-        )
+        d_P_T = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=P_T)
+        d_v_read = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=start_v)
         d_v_write = cl.Buffer(self.ctx, mf.READ_WRITE, size=start_v.nbytes)
 
         current_v = start_v.copy()
 
         for i in range(max_steps):
-            self.k_markov(self.queue, (N,), None, np.int32(N), d_v_read, d_P, d_v_write)
+            # Use k_markov with Transposed Matrix
+            self.k_markov(self.queue, (N,), None, np.int32(N), d_v_read, d_P_T, d_v_write)
 
             if i % 10 == 0:
                 new_v = np.empty_like(current_v)
@@ -163,16 +172,15 @@ class MarkovEngine:
 
         # GPU Path
         mf = cl.mem_flags
+        # OPTIMIZATION: Transpose Log-Transition Matrix
         log_trans = np.log(transition_matrix + epsilon).astype(np.float32)
+        log_trans_T = np.ascontiguousarray(log_trans.T, dtype=np.float32)
+        
         log_emis = np.log(observation_probs + epsilon).astype(np.float32)
         log_delta = np.full(N, -np.log(N), dtype=np.float32)
 
-        d_trans = cl.Buffer(
-            self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=log_trans
-        )
-        d_delta_in = cl.Buffer(
-            self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=log_delta
-        )
+        d_trans_T = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=log_trans_T)
+        d_delta_in = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=log_delta)
         d_delta_out = cl.Buffer(self.ctx, mf.READ_WRITE, size=log_delta.nbytes)
 
         full_backpointer_history = np.zeros((T, N), dtype=np.int32)
@@ -180,7 +188,7 @@ class MarkovEngine:
             self.ctx, mf.WRITE_ONLY, size=full_backpointer_history.nbytes // T
         )
 
-        print(f"🕵️ Decoding {T} days (GPU Accelerated)...")
+        print(f"🕵️ Decoding {T} days (GPU Optimized)...")
 
         for t in range(T):
             d_emis = cl.Buffer(
@@ -193,7 +201,7 @@ class MarkovEngine:
                 None,
                 np.int32(N),
                 d_delta_in,
-                d_trans,
+                d_trans_T, # Pass Transposed Matrix
                 d_emis,
                 d_delta_out,
                 d_backpointers,
@@ -231,8 +239,16 @@ class MarkovEngine:
         log_emis = np.log(observations + 1e-20).astype(np.float32)
 
         # 2. Allocate GPU Memory (VRAM)
-        # We allocate FULL history on GPU to avoid copying back and forth
-        d_trans = cl.Buffer(self.ctx, mf.READ_WRITE | mf.COPY_HOST_PTR, hostbuf=log_trans)
+        # We need TWO transition buffers for optimization:
+        # A. Original (Row-Major) for Backward Pass & Accumulation
+        # B. Transposed (Col-Major) for Forward Pass
+        d_trans = cl.Buffer(self.ctx, mf.READ_WRITE, size=log_trans.nbytes)
+        d_trans_T = cl.Buffer(self.ctx, mf.READ_WRITE, size=log_trans.nbytes)
+        
+        # Initial Copy
+        cl.enqueue_copy(self.queue, d_trans, log_trans)
+        cl.enqueue_copy(self.queue, d_trans_T, np.ascontiguousarray(log_trans.T))
+
         d_emis = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=log_emis)
         
         d_alpha = cl.Buffer(self.ctx, mf.READ_WRITE, size=T * N * 4) # float32 = 4 bytes
@@ -252,11 +268,10 @@ class MarkovEngine:
         for i in range(n_iters):
             
             # --- A. Forward Pass (GPU Loop) ---
-            # Init Alpha[0] on CPU then send (fast enough for 1 step)
+            # Uses Transposed Matrix (d_trans_T) for coalesced reads
             init_alpha[:] = -np.log(N) + log_emis[0]
-            cl.enqueue_copy(self.queue, d_alpha, init_alpha, is_blocking=False) # Write to offset 0
+            cl.enqueue_copy(self.queue, d_alpha, init_alpha, is_blocking=False)
 
-            # Loop t=1 to T
             for t in range(1, T):
                 prev_offset = (t - 1) * N
                 curr_offset = t * N
@@ -265,22 +280,20 @@ class MarkovEngine:
                 self.k_hmm_log(
                     self.queue, (N,), None,
                     np.int32(N),
-                    d_alpha,            # Full Buffer
+                    d_alpha,            
                     np.int32(prev_offset), 
                     np.int32(curr_offset),
-                    d_trans,
-                    d_emis,             # Full Buffer
+                    d_trans_T, # <--- Optimized Read
+                    d_emis,             
                     np.int32(emis_offset)
                 )
 
             # --- B. Backward Pass (GPU Loop) ---
-            # Init Beta[T-1] to 0.0 (log(1))
-            # We can use clEnqueueFillBuffer, but pyopencl 2022+ is cleaner with copy
-            init_beta_end = np.zeros(N, dtype=np.float32) # log(1) = 0
-            beta_end_offset = (T - 1) * N * 4 # Bytes offset
+            # Uses Original Matrix (d_trans) because Backward pass logic matches Row-Major
+            init_beta_end = np.zeros(N, dtype=np.float32) 
+            beta_end_offset = (T - 1) * N * 4 
             cl.enqueue_copy(self.queue, d_beta, init_beta_end, dst_offset=beta_end_offset, is_blocking=False)
 
-            # Loop t = T-2 down to 0
             for t in range(T - 2, -1, -1):
                 curr_offset = t * N
                 future_offset = (t + 1) * N
@@ -289,26 +302,23 @@ class MarkovEngine:
                 self.k_hmm_back(
                     self.queue, (N,), None,
                     np.int32(N),
-                    d_beta,            # Full Buffer
+                    d_beta,            
                     np.int32(future_offset),
                     np.int32(curr_offset),
-                    d_trans,
+                    d_trans, # <--- Optimized Read (Backward needs Row-Major)
                     d_emis,
                     np.int32(future_emis_offset)
                 )
 
             # --- C. Accumulation (GPU) ---
-            # Wait for loops to finish
             self.queue.finish()
 
-            # Condense Alpha/Beta/Emis into new Transition Matrix
             self.k_acc_trans(
                 self.queue, (N, N), None,
                 np.int32(T), np.int32(N),
                 d_alpha, d_beta, d_emis, d_trans, d_new_trans
             )
 
-            # Condense into Gamma Sums
             self.k_acc_gamma(
                 self.queue, (N,), None,
                 np.int32(T), np.int32(N),
@@ -316,15 +326,13 @@ class MarkovEngine:
             )
 
             # --- D. Update & Check Convergence (CPU) ---
-            # We only read back the "Summary Statistics", not the T*N buffers
             new_log_trans_counts = np.empty_like(log_trans)
             log_gamma_sums = np.empty(N, dtype=np.float32)
 
             cl.enqueue_copy(self.queue, new_log_trans_counts, d_new_trans)
             cl.enqueue_copy(self.queue, log_gamma_sums, d_gamma_sums)
             
-            # Calc Likelihood from Alpha[T-1] for convergence check
-            # Read just the last N floats
+            # Calc Likelihood
             alpha_T_offset = (T - 1) * N * 4
             cl.enqueue_copy(self.queue, final_alpha_T, d_alpha, src_offset=alpha_T_offset)
             log_likelihood = np.logaddexp.reduce(final_alpha_T)
@@ -332,8 +340,9 @@ class MarkovEngine:
             # M-Step: Normalize
             log_trans = new_log_trans_counts - log_gamma_sums[:, None]
             
-            # Update GPU Trans Matrix for next iteration
+            # Update BOTH GPU Buffers for next iteration
             cl.enqueue_copy(self.queue, d_trans, log_trans)
+            cl.enqueue_copy(self.queue, d_trans_T, np.ascontiguousarray(log_trans.T))
 
             change = log_likelihood - prev_score
             print(f"   Iter {i + 1}: Likelihood {log_likelihood:.2f} (Delta: {change:.4f})")

@@ -1,4 +1,4 @@
-// kernels.cl - Fixed Write Permissions
+// kernels.cl - Memory Optimized (Transposed Access) + Fixed Write Permissions
 
 // --- HELPER: Log-Sum-Exp Trick ---
 float log_add(float log_a, float log_b) {
@@ -12,14 +12,17 @@ float log_add(float log_a, float log_b) {
 __kernel void markov_step(
     const int N,
     __global const float *current_state,
-    __global const float *transition_mat,
+    __global const float *trans_mat_T, // EXPECTS TRANSPOSED MATRIX
     __global float *next_state)
 {
-    int id = get_global_id(0);
+    int id = get_global_id(0); // Target State (Row in Transposed Mat)
     if (id < N) {
         float sum = 0.0f;
+        int row_start = id * N; // Coalesced Start (Optimization)
+        
         for (int k = 0; k < N; k++) {
-            sum += current_state[k] * transition_mat[k * N + id];
+            // Read sequentially: P_T[id][k] corresponds to P[k][id]
+            sum += current_state[k] * trans_mat_T[row_start + k];
         }
         next_state[id] = sum;
     }
@@ -28,15 +31,17 @@ __kernel void markov_step(
 __kernel void hmm_forward_step(
     const int N,
     __global const float *alpha_prev,
-    __global const float *trans_mat,
+    __global const float *trans_mat_T, // EXPECTS TRANSPOSED MATRIX
     __global const float *emissions,
     __global float *alpha_new)
 {
     int id = get_global_id(0);
     if (id < N) {
         float sum = 0.0f;
+        int row_start = id * N; 
+
         for (int k = 0; k < N; k++) {
-            sum += alpha_prev[k] * trans_mat[k * N + id];
+            sum += alpha_prev[k] * trans_mat_T[row_start + k];
         }
         alpha_new[id] = sum * emissions[id];
     }
@@ -44,47 +49,55 @@ __kernel void hmm_forward_step(
 
 // --- SECTION 2: Advanced Log-Space Operations ---
 
-// 3. Log-Space Forward (FIXED: Removed 'const' from log_alpha_full)
+// 3. Log-Space Forward (Memory Optimized)
 __kernel void hmm_forward_log(
     const int N,
-    __global float *log_alpha_full,        // <--- FIX: Removed 'const' here
+    __global float *log_alpha_full,        // NO CONST (Write Permission Fix Preserved)
     const int prev_offset,
     const int curr_offset,
-    __global const float *log_trans_mat,
+    __global const float *log_trans_mat_T, // EXPECTS TRANSPOSED MATRIX
     __global const float *log_emissions,
     const int emis_offset)
 {
-    int id = get_global_id(0);
+    int id = get_global_id(0); // Target State (Row in Transposed Mat)
     if (id < N) {
         float log_sum = -INFINITY;
-        // Read from 'prev_offset' in the giant buffer
+        int row_start = id * N; 
+        
+        // Loop 'k' (Previous State). 
+        // In Transposed Matrix, 'id' is the Row, 'k' is the Column.
+        // So we read P_T[id][k] which corresponds to P[k][id]
         for (int k = 0; k < N; k++) {
-            float val = log_alpha_full[prev_offset + k] + log_trans_mat[k * N + id];
+            float val = log_alpha_full[prev_offset + k] + log_trans_mat_T[row_start + k];
             if (k == 0) log_sum = val;
             else log_sum = log_add(log_sum, val);
         }
+        
         // Write to 'curr_offset'
-        // Read emission from 'emis_offset'
         log_alpha_full[curr_offset + id] = log_sum + log_emissions[emis_offset + id];
     }
 }
 
-// 4. Log-Space Backward
+// 4. Log-Space Backward (Memory Optimized - Uses ORIGINAL Matrix)
+// Note: Backward pass needs P[i][j], which is naturally Row-Major.
+// So we DO NOT use the Transposed matrix here. It is already optimized!
 __kernel void hmm_backward_log(
     const int N,
     __global float *beta_full,            
     const int future_offset,              
     const int curr_offset,                
-    __global const float *trans,
+    __global const float *trans, // ORIGINAL MATRIX (Row-Major)
     __global const float *emis_full,      
     const int future_emis_offset)         
 {
     int id = get_global_id(0); // State 'i'
     if (id < N) {
         float log_sum = -INFINITY;
+        int row_start = id * N;
+
         for (int j=0; j<N; j++) {
-            // trans(i->j) + emis(t+1, j) + beta(t+1, j)
-            float val = trans[id*N + j] + 
+            // Read sequentially: trans[row_start + j]
+            float val = trans[row_start + j] + 
                         emis_full[future_emis_offset + j] + 
                         beta_full[future_offset + j];
             
@@ -95,11 +108,11 @@ __kernel void hmm_backward_log(
     }
 }
 
-// 5. Viterbi Algorithm
+// 5. Viterbi Algorithm (Memory Optimized)
 __kernel void viterbi_step(
     const int N,
     __global const float *log_delta_prev,
-    __global const float *log_trans_mat,
+    __global const float *log_trans_mat_T, // EXPECTS TRANSPOSED MATRIX
     __global const float *log_emissions,
     __global float *log_delta_new,
     __global int *backpointers)
@@ -108,8 +121,11 @@ __kernel void viterbi_step(
     if (id < N) {
         float max_prob = -INFINITY;
         int best_prev_state = 0;
+        int row_start = id * N;
+
         for (int k = 0; k < N; k++) {
-            float prob = log_delta_prev[k] + log_trans_mat[k * N + id];
+            // Read sequentially: P_T[id][k]
+            float prob = log_delta_prev[k] + log_trans_mat_T[row_start + k];
             if (prob > max_prob) {
                 max_prob = prob;
                 best_prev_state = k;
@@ -120,7 +136,7 @@ __kernel void viterbi_step(
     }
 }
 
-// --- SECTION 3: Learning Accumulators ---
+// --- SECTION 3: Learning Accumulators (Unchanged) ---
 
 // 6. Accumulate Transitions (E-Step)
 __kernel void accumulate_transitions(
@@ -128,11 +144,11 @@ __kernel void accumulate_transitions(
     __global const float *alpha_full, 
     __global const float *beta_full,  
     __global const float *emis_full,  
-    __global const float *trans_mat,  
+    __global const float *trans_mat, // Original Matrix
     __global float *new_trans_counts) 
 {
-    int row = get_global_id(1); // From State i
-    int col = get_global_id(0); // To State j
+    int row = get_global_id(1); 
+    int col = get_global_id(0); 
 
     if (row < N && col < N) {
         float log_sum_xi = -INFINITY;
