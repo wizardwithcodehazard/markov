@@ -1,16 +1,17 @@
 name: Publish to PyPI
 
 on:
-  release:
-    types: [published]  # Runs ONLY when you click "Create Release" on GitHub
+  push:
+    tags:
+      - "v*"
 
 jobs:
   pypi-publish:
     name: Publish to PyPI
     runs-on: ubuntu-latest
-    environment: pypi  # Matches what you typed in PyPI website
+    environment: pypi # Matches what you typed in PyPI website
     permissions:
-      id-token: write  # REQUIRED for Trusted Publishing
+      id-token: write # REQUIRED for Trusted Publishing
 
     steps:
       - name: Checkout Code
