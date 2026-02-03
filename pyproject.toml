@@ -1,6 +1,6 @@
 [project]
 name = "markovgpu-rane" 
-version = "0.2.0"
+version = "0.3.0"
 description = "High-performance Markov Chains & HMMs using OpenCL"
 readme = "README.md"
 authors = [
