@@ -74,3 +74,7 @@ Thumbs.db
 # --- Project Specific ---
 # If your OpenCL kernels generate binary caches
 *.cl.bin
+
+#Demo Files
+demo.py
+biodemo.py
