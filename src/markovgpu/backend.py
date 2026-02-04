@@ -171,7 +171,7 @@ class MarkovEngine:
 
                 # Gamma is just Alpha + Beta
                 log_gamma = alpha + beta
-                log_gamma_sum = np.logaddexp.reduce(log_gamma, axis=0)
+                log_gamma_sum = np.logaddexp.reduce(log_gamma[:-1], axis=0)
 
                 # M-Step
                 log_trans = log_xi_sum - log_gamma_sum[:, None]
